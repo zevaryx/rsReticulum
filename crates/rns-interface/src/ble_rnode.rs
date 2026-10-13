@@ -85,12 +85,9 @@ const BLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const BLE_CONTROL_STAGE_SETTLE: Duration = Duration::from_millis(150);
 const BLE_POST_INIT_SETTLE: Duration = Duration::from_secs(1);
 /// ATT's mandatory 23-byte baseline MTU leaves 20 bytes for a characteristic
-/// value. CoreBluetooth exposes the negotiated per-peripheral limit through
-/// `maximumWriteValueLength(for:)`, but btleplug 0.11.8 neither calls nor
-/// exposes it. Its no-response write path also reports success immediately,
-/// even when CoreBluetooth cannot deliver the value. Upstream Reticulum avoids
-/// this by reading Bleak's `max_write_without_response_size` for every link.
-/// Stay at the guaranteed baseline on Apple until btleplug exposes that value.
+/// value. Preserve the physically reviewed Apple RNode write size and
+/// response pacing through dependency upgrades. Increasing that size requires
+/// separate radio/firmware validation even though btleplug now exposes MTU.
 const BLE_DEFAULT_ATT_WRITE_PAYLOAD: usize = 20;
 /// RNode's reviewed high-throughput ATT MTU is 247 (247 - 3 ATT bytes).
 const BLE_RNODE_ATT_WRITE_PAYLOAD: usize = 244;
@@ -183,12 +180,12 @@ fn unregister_running(id: InterfaceId, running: &Arc<AtomicBool>) {
 /// [`crate::rnode::RNodeDriverHandle::request_shutdown`] so later ID reuse
 /// cannot redirect the request.
 pub fn stop_ble_rnode_interface(id: InterfaceId) {
-    if let Ok(map) = running_map().lock() {
-        if let Some(flag) = map.get(&id) {
-            flag.store(false, Ordering::SeqCst);
-            tracing::info!(id, "BLE RNode: stop signal sent");
-            ble_diag(format!("[ble] stop_ble_rnode_interface({id})"));
-        }
+    if let Ok(map) = running_map().lock()
+        && let Some(flag) = map.get(&id)
+    {
+        flag.store(false, Ordering::SeqCst);
+        tracing::info!(id, "BLE RNode: stop signal sent");
+        ble_diag(format!("[ble] stop_ble_rnode_interface({id})"));
     }
 }
 
@@ -222,7 +219,7 @@ const fn ble_write_chunk_size() -> usize {
 
 const fn ble_write_type() -> WriteType {
     if cfg!(any(target_os = "ios", target_os = "macos")) {
-        // btleplug 0.11.8's CoreBluetooth no-response path returns before the
+        // CoreBluetooth no-response writes can return before the
         // controller accepts the value and does not observe
         // canSendWriteWithoutResponse. Ordered response writes are the only
         // acknowledgement boundary this driver can safely own on Apple.
@@ -272,6 +269,20 @@ fn claim_ble_packet_permit(flow_control: bool, ready: &AtomicBool) -> bool {
         || ready
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
+}
+
+fn select_ble_background(
+    lane: &crate::background_announce::BackgroundAnnounceReceiver,
+    normal_empty: bool,
+    flow_control: bool,
+    ready: &AtomicBool,
+) -> Option<rns_transport::background_egress::BackgroundPacket> {
+    if !normal_empty {
+        return None;
+    }
+    lane.try_start_when(rns_transport::now_f64(), || {
+        claim_ble_packet_permit(flow_control, ready)
+    })
 }
 
 /// Packet admission becomes latched only after the physical generation has
@@ -1162,14 +1173,14 @@ static LINUX_PAIRING_ATTEMPT_COUNTER: std::sync::atomic::AtomicU64 =
 /// `false` if no pairing is in flight or the attempt was aborted.
 #[cfg(target_os = "linux")]
 pub fn linux_submit_passkey(passkey: u32) -> bool {
-    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock() {
-        if let Some(state) = guard.as_mut() {
-            if state.aborted {
-                return false;
-            }
-            if let Some(tx) = state.passkey_tx.take() {
-                return tx.send(passkey).is_ok();
-            }
+    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        if state.aborted {
+            return false;
+        }
+        if let Some(tx) = state.passkey_tx.take() {
+            return tx.send(passkey).is_ok();
         }
     }
     false
@@ -1501,12 +1512,11 @@ async fn resolve_ble_target(
                 }
                 // A populated list without NUS means a different device;
                 // only fall back to the name on empty service lists.
-                if props.services.is_empty() {
-                    if let Some(ref name) = props.local_name {
-                        if name.starts_with("RNode ") {
-                            return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
-                        }
-                    }
+                if props.services.is_empty()
+                    && let Some(ref name) = props.local_name
+                    && name.starts_with("RNode ")
+                {
+                    return Ok((p.clone(), BleTargetResolutionClass::FirstRnode));
                 }
             }
         }
@@ -1525,24 +1535,35 @@ async fn resolve_ble_target(
         }
     }
 
+    // Windows can create a peripheral from an explicit MAC even when this
+    // scan did not see it. Names, empty discovery targets and Apple UUIDs
+    // never enter this path; normal GATT/NUS validation still follows.
+    #[cfg(target_os = "windows")]
+    if crate::ble_connect::known_address(target).is_some() {
+        let peripheral = crate::ble_connect::resolve_address(None, target, |address| async move {
+            adapter.add_peripheral(&address.into()).await
+        })
+        .await
+        .map_err(InterfaceError::SendFailed)?;
+        return Ok((peripheral, BleTargetResolutionClass::PrimaryId));
+    }
+
     // Friendly-name resolution remains a fallback behind the configured
     // platform ID. After an exact first generation, its verified RNode name is
     // retained in memory so a post-bond CoreBluetooth handle replacement can
     // be resolved without changing the public/configured identity.
     for p in &peripherals {
-        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await {
-            if let Some(ref name) = props.local_name {
-                if let Some(resolution_class) =
-                    ble_name_resolution_class(target, generation_stable_name, name)
-                {
-                    if resolution_class == BleTargetResolutionClass::PrimaryName {
-                        ble_diag(format!("[ble] resolve matched by name: {name}"));
-                    } else {
-                        ble_diag("[ble] resolve matched by generation-stable advertised name");
-                    }
-                    return Ok((p.clone(), resolution_class));
-                }
+        if let Ok(Some(props)) = bounded_ble_operation("properties", p.properties()).await
+            && let Some(ref name) = props.local_name
+            && let Some(resolution_class) =
+                ble_name_resolution_class(target, generation_stable_name, name)
+        {
+            if resolution_class == BleTargetResolutionClass::PrimaryName {
+                ble_diag(format!("[ble] resolve matched by name: {name}"));
+            } else {
+                ble_diag("[ble] resolve matched by generation-stable advertised name");
             }
+            return Ok((p.clone(), resolution_class));
         }
     }
 
@@ -1829,17 +1850,14 @@ async fn connect_rnode(
             InterfaceError::SendFailed("NUS TX characteristic not found. Is this an RNode?".into())
         })?
         .clone();
-    if generation_stable_name.is_none() {
-        if let Ok(Some(properties)) =
+    if generation_stable_name.is_none()
+        && let Ok(Some(properties)) =
             bounded_ble_operation("resolved target properties", peripheral.properties()).await
-        {
-            if let Some(name) = properties
-                .local_name
-                .filter(|name| name.starts_with("RNode "))
-            {
-                *generation_stable_name = Some(name);
-            }
-        }
+        && let Some(name) = properties
+            .local_name
+            .filter(|name| name.starts_with("RNode "))
+    {
+        *generation_stable_name = Some(name);
     }
     ble_diag(format!(
         "[ble] RX/TX chars found; RX props={:?} TX props={:?}",
@@ -2207,15 +2225,15 @@ fn parse_linux_ble_address(addr: &str) -> Result<bluer::Address, InterfaceError>
     if let Ok(parsed) = addr.parse::<bluer::Address>() {
         return Ok(parsed);
     }
-    if let Some(tail) = addr.rsplit('/').next() {
-        if let Some(mac_part) = tail.strip_prefix("dev_") {
-            let mac = mac_part.replace('_', ":");
-            return mac.parse::<bluer::Address>().map_err(|e| {
-                InterfaceError::SendFailed(format!(
-                    "invalid BLE address (BlueZ path '{addr}' → '{mac}'): {e}"
-                ))
-            });
-        }
+    if let Some(tail) = addr.rsplit('/').next()
+        && let Some(mac_part) = tail.strip_prefix("dev_")
+    {
+        let mac = mac_part.replace('_', ":");
+        return mac.parse::<bluer::Address>().map_err(|e| {
+            InterfaceError::SendFailed(format!(
+                "invalid BLE address (BlueZ path '{addr}' → '{mac}'): {e}"
+            ))
+        });
     }
     Err(InterfaceError::SendFailed(format!(
         "invalid BLE address {addr}: not a MAC nor a BlueZ D-Bus path"
@@ -2381,13 +2399,12 @@ async fn linux_trigger_pairing(bluer_addr: bluer::Address) -> Result<bool, Inter
         Ok(()) => "ok".to_string(),
         Err(e) => format!("{e}"),
     };
-    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock() {
-        if guard
+    if let Ok(mut guard) = LINUX_PAIRING_STATE.lock()
+        && guard
             .as_ref()
             .is_some_and(|state| state.attempt_id == attempt_id)
-        {
-            *guard = None;
-        }
+    {
+        *guard = None;
     }
     let _ = linux_pairing_finished_sender().send(LinuxPairingFinished { attempt_id, status });
     outcome.map(|()| true)
@@ -2545,14 +2562,14 @@ where
     let deadline = tokio::time::Instant::now() + BleOperationStage::Detect.deadline();
     loop {
         let evidence = protocol_state.evidence();
-        if evidence.detected {
-            if let Some(firmware) = evidence.firmware {
-                return if firmware.is_supported() {
-                    BleHandshakeOutcome::Observed
-                } else {
-                    BleHandshakeOutcome::Retry("RNode firmware is unsupported")
-                };
-            }
+        if evidence.detected
+            && let Some(firmware) = evidence.firmware
+        {
+            return if firmware.is_supported() {
+                BleHandshakeOutcome::Observed
+            } else {
+                BleHandshakeOutcome::Retry("RNode firmware is unsupported")
+            };
         }
         if evidence.radio_initialisation_fault {
             return BleHandshakeOutcome::Retry("RNode reported a radio initialisation fault");
@@ -2685,6 +2702,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
     let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
     let running = register_running(id);
     let (snapshot_publisher, driver) = rnode::new_rnode_driver_observation_with_shutdown(
         RNodeTransportClass::Ble,
@@ -2735,6 +2753,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
         let _cleanup = Cleanup(id, running_task.clone());
 
         let mut pending_outbound: Option<PendingOutbound> = None;
+        let mut pending_background = None;
         let mut first_tx: Option<tokio::time::Instant> = None;
 
         loop {
@@ -3330,6 +3349,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
             );
             active_packet_admission.observe_readiness(protocol_state.readiness());
 
+            background.retire_generation();
             let ready = AtomicBool::new(true);
 
             let mut last_rssi: Option<f32> = None;
@@ -3484,21 +3504,33 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                         break 'read;
                     }
                     GenerationEvent::Poll => {
-                        if pending_outbound.is_none() {
-                            if let (Some((interval, callsign)), Some(first)) =
+                        if pending_outbound.is_none()
+                            && let (Some((interval, callsign)), Some(first)) =
                                 (beacon.as_ref(), first_tx)
-                            {
-                                if first.elapsed() >= *interval {
-                                    tracing::debug!("BLE RNode scheduling station-ID beacon");
-                                    pending_outbound =
-                                        Some(PendingOutbound::new(callsign.clone(), true));
-                                }
-                            }
+                            && first.elapsed() >= *interval
+                        {
+                            tracing::debug!("BLE RNode scheduling station-ID beacon");
+                            pending_outbound = Some(PendingOutbound::new(callsign.clone(), true));
                         }
                     }
                 }
 
-                if pending_outbound.is_some() && claim_ble_packet_permit(flow_control, &ready) {
+                let background_permitted = if pending_outbound.is_none() && outbound_rx.is_empty() {
+                    if let Some(packet) =
+                        select_ble_background(&background, true, flow_control, &ready)
+                    {
+                        pending_outbound = Some(PendingOutbound::new(packet.raw().clone(), false));
+                        pending_background = Some(packet);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if pending_outbound.is_some()
+                    && (background_permitted || claim_ble_packet_permit(flow_control, &ready))
+                {
                     let pending = pending_outbound
                         .as_ref()
                         .expect("pending BLE outbound checked above");
@@ -3522,6 +3554,7 @@ pub async fn spawn_ble_rnode_interface_with_driver_and_options(
                                 first_tx = Some(tokio::time::Instant::now());
                             }
                             pending_outbound = None;
+                            drop(pending_background.take());
                         }
                         Err(error) => {
                             trace_ble_lifecycle(
@@ -3669,6 +3702,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
     let task_rxb = shared_rxb.clone();
     let task_txb = shared_txb.clone();
     let (tx, mut outbound_rx) = mpsc::channel::<Bytes>(256);
+    let background = crate::background_announce::register(&tx)?;
 
     let bitrate = rnode::calculate_bitrate(
         config.spreading_factor,
@@ -3697,6 +3731,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
         let mut backoff = RECONNECT_WAIT;
         let mut initial_attempt = true;
         let mut pending_outbound: Option<NativePendingOutbound> = None;
+        let mut pending_background = None;
         let mut first_tx: Option<tokio::time::Instant> = None;
         // Retain this acknowledgement boundary across native TCP/GATT
         // generations. A failed generation retries; a Ready generation makes
@@ -4090,6 +4125,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                 snapshot_publisher.sync_protocol_state(&protocol_state);
             }
 
+            background.retire_generation();
             let ready = AtomicBool::new(true);
             let mut active_packet_admission = ActiveBlePacketAdmission::for_startup_policy(
                 options.requires_capability_admission(),
@@ -4219,6 +4255,7 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                                     );
                                     break 'read;
                                 }
+                                drop(pending_background.take());
                                 let completed = pending_outbound.take().expect(
                                     "matching bridge acknowledgement requires pending data",
                                 );
@@ -4285,27 +4322,41 @@ pub async fn spawn_ble_rnode_interface_native_with_driver_and_options(
                             );
                             break 'read;
                         }
-                        if pending_outbound.is_none() {
-                            if let (Some((interval, callsign)), Some(first)) =
+                        if pending_outbound.is_none()
+                            && let (Some((interval, callsign)), Some(first)) =
                                 (beacon.as_ref(), first_tx)
-                            {
-                                if first.elapsed() >= *interval {
-                                    tracing::debug!(
-                                        "BLE RNode (native) scheduling station-ID beacon"
-                                    );
-                                    pending_outbound = Some(NativePendingOutbound::new(
-                                        PendingOutbound::new(callsign.clone(), true),
-                                    ));
-                                }
-                            }
+                            && first.elapsed() >= *interval
+                        {
+                            tracing::debug!("BLE RNode (native) scheduling station-ID beacon");
+                            pending_outbound = Some(NativePendingOutbound::new(
+                                PendingOutbound::new(callsign.clone(), true),
+                            ));
                         }
                     }
                 }
 
+                let background_permitted = if pending_outbound.is_none() && outbound_rx.is_empty() {
+                    if let Some(packet) =
+                        select_ble_background(&background, true, flow_control, &ready)
+                    {
+                        pending_outbound = Some(NativePendingOutbound::new(PendingOutbound::new(
+                            packet.raw().clone(),
+                            false,
+                        )));
+                        pending_background = Some(packet);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 let should_write = pending_outbound
                     .as_ref()
                     .is_some_and(|pending| pending.expected_ack.is_none());
-                if should_write && claim_ble_packet_permit(flow_control, &ready) {
+                if should_write
+                    && (background_permitted || claim_ble_packet_permit(flow_control, &ready))
+                {
                     let pending = pending_outbound
                         .as_ref()
                         .expect("native pending outbound checked above");
@@ -4441,6 +4492,7 @@ mod tests {
         bytes
             .chunks(180)
             .map(|chunk| ValueNotification {
+                service_uuid: NUS_SERVICE_UUID,
                 uuid: NUS_TX_CHAR_UUID,
                 value: chunk.to_vec(),
             })
@@ -6186,6 +6238,7 @@ mod tests {
         ] {
             let mut queued = capability_notifications(&response);
             queued.push(ValueNotification {
+                service_uuid: NUS_SERVICE_UUID,
                 uuid: NUS_TX_CHAR_UUID,
                 value: kiss::frame(b"queued-before-init"),
             });
@@ -7222,5 +7275,43 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         handle.online.store(false, Ordering::SeqCst);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn background_actor_ble_selection_preserves_ready_and_control_for_1000_windows() {
+        let (ordinary, mut ordinary_rx) = mpsc::channel(2);
+        let background = crate::background_announce::register(&ordinary).unwrap();
+        let (actor, control, raw) =
+            crate::background_announce::scheduled_actor_with_backlog(ordinary.clone(), 1100);
+        let ready = AtomicBool::new(false);
+        for _ in 0..1000 {
+            control
+                .send(TransportMessage::Tick(rns_transport::messages::TimerTick {
+                    timestamp: rns_transport::now_f64(),
+                }))
+                .await
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(134)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                select_ble_background(&background, ordinary_rx.is_empty(), true, &ready).is_none()
+            );
+            assert_eq!(ordinary.capacity(), 2);
+        }
+        assert!(background.has_offer());
+        ordinary.send(Bytes::from_static(b"local")).await.unwrap();
+        ready.store(true, Ordering::SeqCst);
+        assert!(select_ble_background(&background, ordinary_rx.is_empty(), true, &ready).is_none());
+        assert!(ready.load(Ordering::SeqCst));
+        assert_eq!(ordinary_rx.recv().await.unwrap().as_ref(), b"local");
+        assert!(claim_ble_packet_permit(true, &ready));
+        assert!(select_ble_background(&background, true, true, &ready).is_none());
+        ready.store(true, Ordering::SeqCst);
+        let packet = select_ble_background(&background, true, true, &ready).unwrap();
+        assert_eq!(packet.raw(), &raw);
+        assert!(!ready.load(Ordering::SeqCst));
+        assert!(select_ble_background(&background, true, true, &ready).is_none());
+        drop(packet);
+        control.send(TransportMessage::Shutdown).await.unwrap();
+        actor.await.unwrap();
     }
 }

@@ -1589,7 +1589,7 @@ impl OutboundTransfer {
             // Parse the set of requested (needed) hashes
             let requested_data = &hmu_data[offset..];
             let mut requested_set: HashSet<[u8; MAPHASH_LEN]> = HashSet::new();
-            for chunk in requested_data.chunks_exact(MAPHASH_LEN) {
+            for chunk in requested_data.as_chunks::<MAPHASH_LEN>().0 {
                 let mut mh = [0u8; MAPHASH_LEN];
                 mh.copy_from_slice(chunk);
                 requested_set.insert(mh);
@@ -1711,7 +1711,7 @@ impl OutboundTransfer {
         let requested_hashes_data = &request_data[hash_offset..];
 
         let mut requested_map_hashes: Vec<[u8; MAPHASH_LEN]> = Vec::new();
-        for chunk in requested_hashes_data.chunks_exact(MAPHASH_LEN) {
+        for chunk in requested_hashes_data.as_chunks::<MAPHASH_LEN>().0 {
             let mut mh = [0u8; MAPHASH_LEN];
             mh.copy_from_slice(chunk);
             requested_map_hashes.push(mh);
@@ -1731,14 +1731,13 @@ impl OutboundTransfer {
         for i in search_start..search_end {
             if i < self.resource.map_hashes.len()
                 && requested_map_hashes.contains(&self.resource.map_hashes[i])
+                && let Some(part_data) = self.resource.get_part(i)
             {
-                if let Some(part_data) = self.resource.get_part(i) {
-                    actions.push(TransferAction::SendPart(i, part_data.to_vec()));
-                    if self.sent_part_indices.insert(i) {
-                        self.sent_parts += 1;
-                    }
-                    sent_count += 1;
+                actions.push(TransferAction::SendPart(i, part_data.to_vec()));
+                if self.sent_part_indices.insert(i) {
+                    self.sent_parts += 1;
                 }
+                sent_count += 1;
             }
         }
 
@@ -2419,10 +2418,8 @@ impl InboundTransfer {
         hmu.push(exhausted);
 
         // If exhausted (complete), include the last map hash
-        if is_complete {
-            if let Some(last_mh) = self.resource.map_hashes.last() {
-                hmu.extend_from_slice(last_mh);
-            }
+        if is_complete && let Some(last_mh) = self.resource.map_hashes.last() {
+            hmu.extend_from_slice(last_mh);
         }
 
         // Include the resource hash for identification

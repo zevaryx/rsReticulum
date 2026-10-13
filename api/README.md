@@ -71,10 +71,12 @@ AutoInterface's interoperable UDP ports or alter Reticulum wire formats.
 
 ## Stability
 
-The 1.3 line deliberately replaces publicly mutable recursive discovery state
-with detached observations and exact requester cancellation. See the
-[1.3 migration guide](migrations/1.3.md). Normal runtime lookup/recovery APIs
-remain unchanged. Project minor releases can include breaking API changes;
+The 1.3 line changes the six discovery coordinate fields to `Option<f64>` so
+unknown values remain distinct from real zero. It also replaces publicly mutable
+recursive discovery state with detached observations and exact requester
+cancellation. See the [1.3 migration guide](migrations/1.3.md) for both changes
+and their source, wire, and storage behavior. Normal runtime lookup/recovery
+APIs remain unchanged. Project minor releases can include breaking API changes;
 select an explicit compatible dependency line or reviewed immutable source pin.
 
 Applications that own retry policy can obtain
@@ -115,6 +117,12 @@ dispatch time and packet hash; it is not physical transmission or delivery.
 Dropping an unread bind receipt retires only its unpublished binding; published
 bindings still require the normal explicit cleanup.
 
+`LinkEndpointDispatchBindReceipt::poll_ready` registers a task waker without
+publishing the binding. It retains a ready result until `try_recv` or awaiting
+consumes it; cancellation between readiness and consumption still retires the
+unpublished endpoint. This supports event-driven delivery owners without
+changing existing periodic consumers or proof timing.
+
 `try_send_cancellable` additionally returns an exact cancellation capability.
 It requests removal while the packet is still awaiting local admission; it
 cannot recall bytes already admitted to a driver or affect another binding.
@@ -148,8 +156,8 @@ treated as stable merely because they are publicly reachable.
 
 The `api/` directory contains the evidence used by CI:
 
-- `stability.json` records package tiers, source commits, snapshot hashes, and
-  the current review decision;
+- `stability.json` records package tiers, compatibility baselines, and snapshot
+  hashes;
 - `snapshots/` records the explicit all-feature Apple ARM64 Rust API and the
   manifest, feature, dependency, target, and MSRV contract; and
 - `fixtures/` compiles recommended and retained import paths as an external
@@ -170,6 +178,7 @@ cargo check --manifest-path api/fixtures/Cargo.toml --locked
 cargo check --manifest-path api/fixtures/Cargo.toml --all-features --locked
 ```
 
-Snapshot updates require a clean source commit and an explicit review recorded
-in `api/stability.json`. Additions, removals, deprecations, platform impact, and
-version consequences must be reviewed before accepting new evidence.
+After reviewing an API change, run
+`python3 tools/check-api-baseline.py --update` and commit the source and snapshot
+changes together. CI compares snapshots with the current source; compatibility
+checks retain the historical baseline.

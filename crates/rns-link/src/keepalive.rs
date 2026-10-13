@@ -137,22 +137,23 @@ impl KeepaliveState {
 
     pub(crate) fn is_stale_at(&self, now: Instant) -> bool {
         let mut latest = self.last_inbound;
-        if let Some(proof) = self.last_proof {
-            if proof > latest {
-                latest = proof;
-            }
+        if let Some(proof) = self.last_proof
+            && proof > latest
+        {
+            latest = proof;
         }
-        if let Some(activated) = self.activated_at {
-            if activated > latest {
-                latest = activated;
-            }
+        if let Some(activated) = self.activated_at
+            && activated > latest
+        {
+            latest = activated;
         }
         now.saturating_duration_since(latest) >= self.stale_time
     }
 
     /// How long to wait in STALE before tearing the link down.
     pub fn stale_grace_timeout(&self, rtt: Duration) -> Duration {
-        rtt * KEEPALIVE_TIMEOUT_FACTOR as u32 + Duration::from_secs_f64(STALE_GRACE)
+        rtt.saturating_mul(KEEPALIVE_TIMEOUT_FACTOR as u32)
+            .saturating_add(Duration::from_secs_f64(STALE_GRACE))
     }
 
     pub fn mark_keepalive_sent(&mut self) {

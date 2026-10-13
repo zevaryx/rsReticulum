@@ -16,12 +16,16 @@ pub mod ble_central_apple;
 pub mod ble_central_apple_connect;
 #[cfg(feature = "ble")]
 pub mod ble_central_lifecycle;
+#[cfg(all(feature = "ble", any(target_os = "windows", target_os = "linux", test)))]
+mod ble_connect;
 #[cfg(feature = "ble")]
 pub mod ble_peer;
 #[cfg(feature = "ble")]
 pub mod ble_peer_lifecycle;
 #[cfg(feature = "ble")]
 pub mod ble_rnode;
+#[cfg(all(feature = "ble", any(target_os = "ios", target_os = "macos", test)))]
+mod ble_tx_queue;
 pub mod hdlc;
 pub mod i2p;
 pub mod kiss;
@@ -52,3 +56,5 @@ pub mod tcp;
 pub mod traits;
 pub mod udp;
 pub mod weave;
+
+mod background_announce;

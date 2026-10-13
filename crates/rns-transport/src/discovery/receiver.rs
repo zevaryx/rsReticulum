@@ -132,12 +132,45 @@ impl ReceiverMetrics {
     }
 
     fn increment(counter: &AtomicU64) -> u64 {
-        let previous = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .unwrap_or(u64::MAX);
-        previous.saturating_add(1)
+        // Keep the saturating update compatible with Rust 1.87 and newer
+        // toolchains, without depending on renamed atomic convenience APIs.
+        let mut previous = counter.load(Ordering::Relaxed);
+        loop {
+            let next = previous.saturating_add(1);
+            match counter.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(current) => previous = current,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_increments_preserve_counts_and_saturate() {
+        let counter = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1_000 {
+                        ReceiverMetrics::increment(&counter);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 8_000);
+        counter.store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(ReceiverMetrics::increment(&counter), u64::MAX);
+        assert_eq!(ReceiverMetrics::increment(&counter), u64::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
 
@@ -378,10 +411,10 @@ impl ReceiverConfig {
             stamp_value,
         } = material;
         let announced_identity = event.identity_hash.unwrap_or(info.transport_id);
-        if let Some(sources) = self.discovery_sources.as_ref() {
-            if !sources.iter().any(|s| s == &announced_identity) {
-                return Outcome::Rejected(Reason::UnauthorizedSource);
-            }
+        if let Some(sources) = self.discovery_sources.as_ref()
+            && !sources.iter().any(|s| s == &announced_identity)
+        {
+            return Outcome::Rejected(Reason::UnauthorizedSource);
         }
 
         let now = now_unix();
@@ -693,9 +726,9 @@ mod tests {
             transport_id: [0x55; 16],
             interface_type: "BackboneInterface".into(),
             transport_enabled: true,
-            latitude: 1.0,
-            longitude: 2.0,
-            height: 3.0,
+            latitude: Some(1.0),
+            longitude: Some(2.0),
+            height: Some(3.0),
             port: Some(4965),
             reachable_on: Some("127.0.0.1".into()),
             ..Default::default()

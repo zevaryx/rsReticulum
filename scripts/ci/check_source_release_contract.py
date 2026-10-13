@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_RUST_VERSION = "1.87"
+EXPECTED_RUST_VERSION = "1.89"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -79,10 +79,33 @@ def check_workflow_actions() -> None:
 def check_release_workflow() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text()
 
-    if not re.search(r"^\s*toolchain:\s*1\.87\.0\s*$", workflow, re.MULTILINE):
-        fail("release workflow does not select Rust 1.87.0")
-    if "ref: ${{ env.RELEASE_TAG }}" not in workflow:
-        fail("release workflow does not check out RELEASE_TAG")
+    if not re.search(r"^\s*toolchain:\s*1\.89\.0\s*$", workflow, re.MULTILINE):
+        fail("release workflow does not select Rust 1.89.0")
+    if "ref: ${{ env.SOURCE_REF }}" not in workflow or "SOURCE_REF: ${{ github.sha }}" not in workflow:
+        fail("release workflow must check out the immutable event commit")
+    if "    if: github.event_name == 'push' || !inputs.qualify_only\n    needs: package" not in workflow:
+        fail("publication must exclude qualification and require verified archives")
+    if "--candidate-tag" not in workflow or "actions/workflows/ci.yml/runs?head_sha=" not in workflow:
+        fail("release workflow must qualify untagged sources and require exact-source CI")
+
+    publishers = re.findall(
+        r"^      - uses: softprops/action-gh-release@[0-9a-f]{40}[^\n]*\n"
+        r"        with:\n((?:          [^\n]*\n)+)",
+        workflow,
+        re.MULTILINE,
+    )
+    if len(publishers) != 1:
+        fail("release workflow must have one explicit GitHub publisher")
+    inputs = dict(re.findall(r"^          ([a-z_]+): (.*)$", publishers[0], re.MULTILINE))
+    expected = {
+        "tag_name": "${{ env.RELEASE_TAG }}",
+        "name": "${{ env.RELEASE_TAG }}",
+        "body": '""',
+        "generate_release_notes": "false",
+        "append_body": "false",
+    }
+    if any(inputs.get(key) != value for key, value in expected.items()) or "body_path" in inputs:
+        fail("GitHub releases must use the exact version tag as title and an empty body")
 
     release_builds = [
         line.strip()
@@ -113,6 +136,8 @@ def check_documentation(version: str) -> None:
 
 
 def check_release_tag(release_tag: str, version: str) -> None:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", release_tag):
+        fail("release tags must have the form vX.Y.Z")
     expected_tag = f"v{version}"
     if release_tag != expected_tag:
         fail(f"release tag {release_tag!r} does not match {expected_tag!r}")
@@ -133,9 +158,21 @@ def check_release_tag(release_tag: str, version: str) -> None:
         fail(f"HEAD {head} is not the commit named by {release_tag} ({tagged_commit})")
 
 
+def check_candidate_tag(tag: str, version: str) -> None:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag) or tag != f"v{version}":
+        fail("candidate tag must match the workspace version as vX.Y.Z")
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/tags/{tag}"], cwd=ROOT
+    )
+    if result.returncode != 1:
+        fail("candidate qualification requires an untagged version")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--release-tag")
+    tags = parser.add_mutually_exclusive_group()
+    tags.add_argument("--release-tag")
+    tags.add_argument("--candidate-tag")
     args = parser.parse_args()
 
     version = check_packages(metadata())
@@ -147,6 +184,8 @@ def main() -> None:
         cwd=ROOT,
         check=True,
     )
+    if args.candidate_tag:
+        check_candidate_tag(args.candidate_tag, version)
     if args.release_tag:
         check_release_tag(args.release_tag, version)
     print(f"source-release contract passed for rsReticulum {version}")
